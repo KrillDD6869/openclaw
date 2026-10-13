@@ -9,7 +9,10 @@ import type { AgentDeliveryEvidence } from "../agents/embedded-agent-runner/deli
 import { buildMainSessionRecoveryClearPatch } from "../agents/main-session-recovery/main-session-recovery-clear.js";
 import { recoverRestartAbortedMainSessions } from "../agents/main-session-recovery/main-session-restart-recovery.js";
 import { maybeWakeRequesterAfterAllChildrenSettled } from "../agents/subagents/announce/subagent-announce.requester-settle-wake.js";
-import { settleRequesterCompletionBatch } from "../agents/subagents/completion/subagent-completion-admission.store.js";
+import {
+  mutateRequesterCompletionBatch,
+  SubagentCompletionSourceChangedError,
+} from "../agents/subagents/completion/subagent-completion-admission.store.js";
 import { subagentRuns } from "../agents/subagents/registry/subagent-registry-memory.js";
 import { loadSubagentRegistryFromSqlite } from "../agents/subagents/registry/subagent-registry-state.fixture.test-support.js";
 import { bindSubagentRunRecord } from "../agents/subagents/registry/subagent-registry.store.codec.js";
@@ -24,6 +27,7 @@ import {
   loadTranscriptEventsSync,
   updateSessionEntry,
 } from "../config/sessions/session-accessor.js";
+import * as pendingInputs from "../config/sessions/session-accessor.pending-inputs.js";
 import { resolvePhysicalSessionStorePath } from "../config/sessions/session-store-path.js";
 import { bindGatewayContextResolver } from "../plugins/runtime/gateway-request-scope.js";
 import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
@@ -84,6 +88,8 @@ describe("public yielded settle replay with real Gateway admission", () => {
     child = {
       runId: `settle-replay-child-${sequence}`,
       childSessionKey: `agent:main:subagent:settle-replay-child-${sequence}`,
+      childAgentId: "main",
+      childSessionIdentity: { sessionId: `settle-replay-child-session-${sequence}` },
       requesterSessionKey,
       requesterDisplayKey: requesterSessionKey,
       requesterAgentId: "main",
@@ -145,10 +151,16 @@ describe("public yielded settle replay with real Gateway admission", () => {
       Parameters<typeof maybeWakeRequesterAfterAllChildrenSettled>[0]["completeBatch"]
     >(async (batch, _generation, outcome, onCommitted) => {
       expect(outcome).toBeDefined();
-      await settleRequesterCompletionBatch({
-        entries: batch.map((subagent) => ({ subagent })),
-        outcome: outcome!,
-        isCurrent: () => subagentRuns.get(child.runId) === child,
+      await mutateRequesterCompletionBatch({
+        entries: batch,
+        operation: { kind: "settle", outcome: outcome! },
+        assertCurrent: () => {
+          if (subagentRuns.get(child.runId) !== child) {
+            throw new SubagentCompletionSourceChangedError(
+              "Subagent completion owner changed before settlement",
+            );
+          }
+        },
       });
       onCommitted?.();
     });
@@ -410,11 +422,11 @@ describe("public yielded settle replay with real Gateway admission", () => {
       persistChild(entry);
     }
     const completion = vi.fn();
-    const acceptedMessages: Parameters<typeof sessionAccessor.stageSessionPendingInput>[1][] = [];
+    const acceptedMessages: Parameters<typeof pendingInputs.stageSessionPendingInput>[1][] = [];
     const admittedSources: Array<string | undefined> = [];
-    const realStage = sessionAccessor.stageSessionPendingInput;
+    const realStage = pendingInputs.stageSessionPendingInput;
     const observeAdmission = vi
-      .spyOn(sessionAccessor, "stageSessionPendingInput")
+      .spyOn(pendingInputs, "stageSessionPendingInput")
       .mockImplementation(async (scope, options) => {
         acceptedMessages.push(options);
         if (revoked && acceptedMessages.length === 2) {
@@ -688,7 +700,7 @@ describe("public yielded settle replay with real Gateway admission", () => {
         });
         await original;
         expect(loadSessionEntryReadOnly(scope)).toMatchObject({
-          status: "running",
+          status: "interrupted",
           abortedLastRun: true,
           restartRecoveryRuns: [expect.objectContaining({ runId })],
         });
