@@ -40,15 +40,18 @@ export class CodexNativeSubagentCompletionDelivery {
     if (existing) {
       return existing;
     }
-    const attempt = this.deliverAttempt(state, childState);
+    // Publish the shared attempt before releasing a client can synchronously close it.
+    const attempt = Promise.resolve().then(() => this.deliverAttempt(state, childState));
     this.attempts.set(childState, attempt);
     const release = () => {
-      if (this.attempts.get(childState) === attempt) {
-        this.attempts.delete(childState);
-      }
+      this.attempts.delete(childState);
     };
     void attempt.then(release, release);
     return attempt;
+  }
+
+  async join(child: ChildState): Promise<void> {
+    await this.attempts.get(child);
   }
 
   private async deliverAttempt(state: ParentState, childState: ChildState): Promise<void> {
@@ -56,12 +59,15 @@ export class CodexNativeSubagentCompletionDelivery {
     if (!completion || !this.isCurrent(state, childState)) {
       return;
     }
-    if (childState.deliveringCompletion || childState.completionDeliveryTimer) {
+    if (childState.completionDeliveryTimer) {
       return;
     }
-    childState.deliveringCompletion = true;
     let deferredToForeground = false;
     try {
+      if (childState.cancellationRequested && completion.status === "cancelled") {
+        // Stop owns durable cancellation acknowledgement before releasing this child.
+        return;
+      }
       if (!this.prepareDelivery(state, childState)) {
         return;
       }
@@ -112,16 +118,13 @@ export class CodexNativeSubagentCompletionDelivery {
         this.dependencies.unregisterChild(childState);
         return;
       }
-      if (delivery.recoveryPending) {
-        this.scheduleRetry(
-          childState,
-          delivery.error ?? "requester recovery owns completion",
-          false,
-        );
-        return;
-      }
-      const error = delivery.error ?? "completion delivery did not produce a parent response";
-      this.scheduleRetry(childState, error);
+      const recoveryPending = delivery.recoveryPending;
+      const error =
+        delivery.error ??
+        (recoveryPending
+          ? "requester recovery owns completion"
+          : "completion delivery did not produce a parent response");
+      this.scheduleRetry(childState, error, !recoveryPending);
     } catch (error) {
       if (!this.isCurrent(state, childState)) {
         return;
@@ -143,15 +146,12 @@ export class CodexNativeSubagentCompletionDelivery {
         // pending unregister. Once attempted, sleeping retries retain only delivery authority.
         childState.completionCustody?.settleExecution();
       }
-      childState.deliveringCompletion = false;
     }
   }
 
   finish(state: ParentState, child: ChildState): void {
-    if (child.completionDeliveryTimer) {
-      clearTimeout(child.completionDeliveryTimer);
-      child.completionDeliveryTimer = undefined;
-    }
+    clearTimeout(child.completionDeliveryTimer);
+    child.completionDeliveryTimer = undefined;
     void this.deliverPending(state, child);
   }
 
@@ -192,7 +192,7 @@ export class CodexNativeSubagentCompletionDelivery {
         }
       }
       child.nativeCompletionDelivered = true;
-      if (child.pendingCompletion && !child.deliveringCompletion) {
+      if (child.pendingCompletion && !this.attempts.has(child)) {
         this.finish(deliveryParent, child);
       }
     }
@@ -208,9 +208,7 @@ export class CodexNativeSubagentCompletionDelivery {
 
   release(childState: ChildState): void {
     childState.completionCustody?.release();
-    if (childState.completionDeliveryTimer) {
-      clearTimeout(childState.completionDeliveryTimer);
-    }
+    clearTimeout(childState.completionDeliveryTimer);
     const deliveryOwnerKey = childState.deliveryOwnerKey;
     if (deliveryOwnerKey && completionDeliveryOwners.get(deliveryOwnerKey) === childState) {
       completionDeliveryOwners.delete(deliveryOwnerKey);
