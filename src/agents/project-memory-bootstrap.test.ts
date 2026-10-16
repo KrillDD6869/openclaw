@@ -2,7 +2,6 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { MemorySearchResult } from "../memory-host-sdk/host/types.js";
 import type { MemorySearchHit } from "../plugins/memory-provider-types.js";
 import {
-  buildProjectMemoryWriteInstruction,
   filterProjectScopedCuratedContextFiles,
   prepareProjectMemoryBootstrap,
 } from "./project-memory-bootstrap.js";
@@ -165,7 +164,6 @@ describe("project memory bootstrap", () => {
   it("keeps sessions without an active repository unchanged", async () => {
     await expect(prepareEntries(entries, [])).resolves.toEqual([]);
     expect(runtimeMocks.getManager).not.toHaveBeenCalled();
-    expect(buildProjectMemoryWriteInstruction(undefined)).toBe("");
   });
 
   it("filters tagged raw entries fail-closed with the all-keys rule", () => {
@@ -241,13 +239,6 @@ describe("project memory bootstrap", () => {
       activeProjectKeys: ["github.com/OpenClaw/OpenClaw"],
       limit: 48,
     });
-  });
-
-  it("builds scoped write guidance without capturing global memory", () => {
-    const instruction = buildProjectMemoryWriteInstruction("github.com/OpenClaw/OpenClaw");
-    expect(instruction).toContain("<!-- project: github.com/OpenClaw/OpenClaw -->");
-    expect(instruction).toContain("Do not project-scope user-level preferences");
-    expect(buildProjectMemoryWriteInstruction("path:/tmp/unsafe-->note")).toBe("");
   });
 
   it("cites legacy chunks by start line from the already-loaded runtime", async () => {
@@ -351,6 +342,43 @@ describe("native project memory bootstrap", () => {
     expect(rendered).toContain("Foreign fact.");
   });
 
+  it("filters every project key without requesting unsupported provider filtering", async () => {
+    runtimeMocks.getProvider.mockResolvedValue({
+      provider: {
+        capabilities: { candidates: ["trigger", "project"], projectFilter: false },
+        candidates: runtimeMocks.listCurated,
+        close: vi.fn(),
+      },
+    });
+    runtimeMocks.listCurated.mockResolvedValue({
+      hits: [
+        {
+          ...entries[0]!,
+          automaticRecall: { eligible: true, projectKeys: ["alpha", "beta"] },
+        },
+        {
+          ...entries[1]!,
+          automaticRecall: { eligible: true, projectKeys: ["alpha", "inactive"] },
+        },
+      ],
+    });
+
+    const rendered = (
+      await prepareProjectMemoryBootstrap({
+        cfg: {},
+        agentId: "main",
+        activeProjectKeys: ["alpha", "beta"],
+      })
+    ).join("\n");
+
+    expect(runtimeMocks.listCurated).toHaveBeenCalledExactlyOnceWith({
+      kind: "project",
+      limit: 48,
+    });
+    expect(rendered).toContain("Use the release helper.");
+    expect(rendered).not.toContain("Foreign fact.");
+  });
+
   it("uses the dedicated curated listing instead of a daily-note-crowded search", async () => {
     runtimeMocks.search.mockResolvedValue(
       Array.from({ length: 100 }, (_, index) => ({
@@ -361,7 +389,7 @@ describe("native project memory bootstrap", () => {
     runtimeMocks.listCurated.mockResolvedValue({ hits: [entries[0]] });
     runtimeMocks.getProvider.mockResolvedValue({
       provider: {
-        capabilities: { candidates: ["project"] },
+        capabilities: { candidates: ["project"], projectFilter: true },
         search: runtimeMocks.search,
         candidates: runtimeMocks.listCurated,
         close: vi.fn(),
@@ -425,7 +453,9 @@ describe("native project memory bootstrap", () => {
     expect(runtimeMocks.listCurated).toHaveBeenCalledOnce();
     expect(close).toHaveBeenCalledOnce();
     expect(logMocks.debug).toHaveBeenCalledWith(
-      expect.stringContaining("project memory cleanup failed: Error: provider cleanup failed"),
+      expect.stringContaining(
+        "project memory cleanup failed for memory-core: Error: provider cleanup failed",
+      ),
     );
   });
 
