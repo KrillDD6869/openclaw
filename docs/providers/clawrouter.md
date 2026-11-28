@@ -44,6 +44,8 @@ you only need an issued ClawRouter key.
     `plugins.allow`, add `clawrouter` to that list before enabling it. For a
     custom deployment, set `models.providers.clawrouter.baseUrl` to the
     ClawRouter origin; the default is `https://clawrouter.openclaw.ai`.
+    Live and retained model catalogs must come from that configured origin.
+    Static capability declarations remain scoped to their declared endpoints.
 
   </Step>
   <Step title="List granted models">
@@ -68,6 +70,65 @@ you only need an issued ClawRouter key.
 
   </Step>
 </Steps>
+
+## Bedrock Converse
+
+The exact `aws-bedrock/amazon.nova-lite-v1:0` row can use the native Bedrock
+ConverseStream SDK when a current proxy-key catalog grants `llm.chat` and the
+`aws_bedrock.converse_stream` → `aws_bedrock.converse_eventstream` operation.
+This requires qualified router runtime support and an explicit model declaration;
+client support alone does not activate an offer or prove live AWS entitlement.
+Claude models, regional aliases and inference profiles do not inherit this qualification.
+
+Native transport uses `/v1/native/aws-bedrock/model/<encoded-model>/converse-stream`.
+Manifest transport uses its declared `/v1/proxy/aws-bedrock/<endpoint>` and wraps
+the **final AWS-serialized JSON** in `{ method, pathParams: { model }, query, body }`.
+The selected model owns the path. The SDK retains native message, tool and image
+serialization and EventStream decoding. The client accepts a complete bounded
+response; this is not an incremental-delivery guarantee.
+
+Both transports use only the selected ClawRouter key, recheck its fresh catalog,
+honor caller cancellation and disable SDK retries. AWS environment credentials,
+profiles and `AWS_BEDROCK_SKIP_AUTH` cannot change proxy authentication or destination.
+Direct Amazon Bedrock configuration keeps its existing behavior.
+
+## Vercel native Messages
+
+The frozen `vercel-ai-gateway/anthropic/claude-sonnet-4.6` row uses OpenClaw's
+native Anthropic SDK and replay handling when the current key's catalog grants
+the exact native Messages offer. A simultaneous Chat offer does not change that
+model's protocol. Other rows and mixed providers keep their existing selection behavior.
+
+This requires a deployment that advertises
+`POST /v1/native/vercel-ai-gateway/v1/messages` with matching
+`anthropic.messages` request and response formats. The SDK base is
+`/v1/native/vercel-ai-gateway`; it appends `/v1/messages`. The router must map
+that public path to upstream `/messages` under its configured Vercel `/v1` base.
+The older public `/messages` route is not SDK-compatible and is not substituted.
+The [published path-mapping contract](https://github.com/openclaw/clawrouter/pull/583)
+does not activate this provider declaration by itself.
+
+Only the ClawRouter credential is used. For this model, missing or ineligible
+native offers, mismatched upstream identities and unsupported formats do not
+fall back to Chat or local Anthropic/Vercel credentials. This client support does not establish live
+Vercel entitlement or an upstream tariff.
+
+## Utility model
+
+When `agents.defaults.utilityModel` is unset, a ClawRouter primary model uses a
+small model from the same vendor for short internal tasks such as titles,
+progress narration, Activity recaps, Side chat, and composer predictions:
+
+| Primary model vendor       | Automatic utility model                 |
+| -------------------------- | --------------------------------------- |
+| `clawrouter/openai/...`    | `clawrouter/openai/gpt-6-luna`          |
+| `clawrouter/anthropic/...` | `clawrouter/anthropic/claude-haiku-5-5` |
+
+OpenClaw selects it only when your key's model catalog lists it. Other vendors,
+and keys without that grant, keep the behavior of having no automatic utility
+model. GPT-6 Luna is text-only through ClawRouter, so Side chat questions with
+images need an image-capable `utilityModel`. An explicit `utilityModel`, or
+`""` to disable utility routing, always wins.
 
 ## Decision models
 
@@ -100,9 +161,10 @@ primary, fallback, utility, thinking, or Fast settings.
 
 The bundled `clawrouter` owner implements native OpenAI Decisions for Boolean,
 choice, and score questions. Inputs are explicit text/JSON or inline PNG, JPEG,
-or WebP images (up to 4 MiB). Limits are 200 questions per batch and 255 choice
-alternatives. Reasoning accepts only `auto` (or omission). Provider probabilities,
-confidence, usage, and individual refusals remain typed; there is no chat/JSON
+or WebP images (up to 4 MiB). V2 batches support up to 400 questions and 255 choice
+alternatives. Legacy V1 callers retain the host's 256-question limit; use
+`contractVersion: 2` for larger batches. Reasoning accepts only `auto` (or omission).
+Provider probabilities, confidence, usage, and individual refusals remain typed; there is no chat/JSON
 fallback, invented probability, or ambient conversation history.
 
 Static decision catalog support is **not a key grant**. Each evaluation checks
@@ -333,6 +395,17 @@ are treated as text-only. When `input` is absent, OpenClaw retains its existing
 family inference and recognizes exact known native OpenAI image-capable models;
 unknown model names do not inherit image support from a new GPT generation prefix.
 
+OpenAI Responses and Anthropic Messages rows also receive the model facts that
+the bundled OpenAI and Anthropic catalogs declare for the same upstream model id
+and API: the Code Mode tier (so the default `tools.codeMode: "auto"` engages for
+the same models), whether the model accepts `temperature` (GPT-6 and GPT-5.6
+requests drop it instead of failing upstream), and image size limits (for
+example 2576 px for current Claude models). This works without enabling those
+plugins. Matching is exact; unknown, renamed, or future models inherit nothing.
+Reasoning efforts still come from the ClawRouter catalog. Requests to Claude with
+extended thinking drop a trailing assistant prefill, as the native Anthropic
+provider does.
+
 Adding a model to a supported ClawRouter provider needs no OpenClaw release.
 Successful catalog responses, including an empty granted-model list, are reused
 for one hour per endpoint and resolved credential. Ordinary model-list reads
@@ -373,21 +446,55 @@ unsupported request format is intentionally not advertised as an OpenClaw
 text model. Normalize those providers to one of the supported contracts in
 ClawRouter rather than sending an incompatible payload.
 
+## Hosted web search
+
+OpenClaw can use OpenAI's hosted `web_search` on a ClawRouter Responses route
+only when the credential-scoped catalog explicitly advertises both support
+and admission for that offer. Model names never enable hosted search.
+
+The versioned catalog contract is:
+
+- The OpenAI model has `nativeCapabilities.version` equal to
+  `clawrouter.native-capabilities.v1`, with `web_search` in
+  `nativeCapabilities.endpoints.responses.hostedTools`.
+- Its eligible HTTP unified `/v1/responses` offer has
+  `hostedToolAdmission.version` equal to `clawrouter.hosted-tool-admission.v1`
+  and `hostedToolAdmission.web_search` equal to `admitted`.
+
+Missing, unknown-version, or unadmitted facts keep managed search unchanged.
+Disabling web search, denying `web_search` in tool policy, or selecting another
+search provider also prevents hosted replacement. An admitted route declares
+`{ type: "web_search" }` instead of the managed search function; returned URL
+citations are visible as clickable source links.
+
+Admission is not a guarantee that every future request fits a budget. ClawRouter
+still validates current grants and pricing at dispatch. In particular, this
+contract does not qualify arbitrary reasoning requests under hard-reserve
+budgets, and OpenClaw does not invent a hosted-tool call cap. A deployment that
+does not yet produce the versioned facts remains on managed search. If a route
+rejects hosted search, OpenClaw surfaces that error rather than retrying with a
+different key or silently replacing the configured search provider.
+
 ## Image generation
 
 The bundled plugin also registers ClawRouter with the native image runtime,
-`image_generate` tool, and `openclaw infer image generate` CLI. This is **JSON
-generation only** through `/v1/images/generations`: edits, masks, variations, and
-streaming are not supported. The ClawRouter deployment must support this route.
-Plugin readiness alone does not mean the current key can generate images.
+`image_generate` tool, and `openclaw infer image generate` CLI. OpenAI text-only requests
+use `/v1/images/generations`; requests with reference images use the JSON
+`/v1/images/edits` route without changing the selected model. The ClawRouter
+deployment must support the requested route. Masks, variations, and streaming
+are not supported; plugin readiness alone does not establish key access.
 
 Supported wire-model IDs are `openai/gpt-image-2.5-flare`,
 `openai/gpt-image-2.5-sunburst`, and their `-2026-09-08` snapshots. These IDs are
-protocol support, not grants. Image discovery advertises a model only when the
+protocol support, not grants. Text-only generation is advertised only when the
 same key's live `/v1/catalog` contains its `image.generation` capability and an
-eligible HTTP offer for the unified `/v1/images/generations` route.
+eligible HTTP offer for the unified `/v1/images/generations` route. Editing
+requires its own `image.edit` capability and eligible `/v1/images/edits` offer.
+Each mode is listed independently; a generation grant does not enable edits.
 Request-dependent affordability remains selectable; the service decides the
-actual request's grant and budget. Missing, unknown, empty, or failed catalogs
+actual request's grant and budget. Unbounded reference-input tokens fail closed
+under hard budgets unless an existing fixed tariff applies; existing soft/unmetered
+policies can settle measured usage. The plugin changes neither policies nor keys. Missing, unknown, empty, or failed catalogs
 never fall back to a static list or a previous successful image lookup.
 
 There is no implicit ClawRouter image default. Select an entitled image model
@@ -401,7 +508,11 @@ openclaw infer image generate \
   --size 1024x1024 --output-format png --output ./square.png
 ```
 
-Generation and the immediately preceding catalog check use the same resolved
+The tool sends authorized reference bytes as inline PNG, JPEG, or WebP—not file
+paths, remote URLs, or file IDs. Before purchase, it enforces at most 16 references,
+4 MiB decoded per image, and 8 MiB for the entire JSON request, including base64 encoding.
+
+Generation/editing and the immediately preceding catalog check use the same resolved
 ClawRouter credential, including a configured auth-profile binding. A missing
 or rejected bound profile does not switch to another profile or an upstream
 OpenAI key. HTTP failures preserve their status and do not retry a paid image
@@ -410,6 +521,86 @@ downloads and private-network checks. Cancellation and the request deadline
 cover catalog lookup, generation, and result downloads. Prompt, image-count, and
 explicit size bounds come from that model’s current catalog generation limits;
 unknown limits do not authorize generation.
+
+### Native Google images
+
+The exact `google/gemini-3.1-flash-image` and `google/gemini-3-pro-image`
+identities require a fresh, same-key catalog offer from `google-gemini` with
+`image.generate`, request `google.image_generate` and response `google.image`.
+Native offers call `/v1/native/google-gemini/v1beta/models/{upstream}:generateContent`.
+Manifest offers call the advertised `image_generate` endpoint with
+`{ body, pathParams: { model: selectedUpstream } }`. No generic Chat route or
+unqualified Interactions operation substitutes for this contract.
+
+The actual image runtime shares Google's native request and image decoder with
+the direct provider. It accepts a prompt and at most five inline PNG/JPEG/WebP
+references, the frozen aspect ratios, and `1K`/`2K`/`4K` geometry.
+One call performs one generation; a four-image output bound is not a request for
+four images. Count overrides above one, HEIC/HEIF, provider-specific options,
+file references and remote assets are not supported by this qualified wrapper.
+
+Request and response JSON are each bounded to 8 MiB. Complete STOP output,
+explicit supported MIME types and valid image siblings are required; up to four
+outputs share a 4 MiB decoded limit. Cancellation remains active through EOF.
+The client neither follows generation redirects nor repeats a paid POST.
+Only the selected ClawRouter key is sent; native Google credentials and
+credential-header overrides are rejected.
+
+Catalog eligibility is required for every request; stale, foreign, revoked or
+unsupported offers fail before generation. Missing pricing stays unknown.
+ClawRouter's upstream-dollar hard-budget guard and explicit policy-fixed billing
+remain distinct. Client support does not activate the source-owned declaration
+or certify Worker integration; those require the matching runtime and snapshot.
+
+## Native Gradium speech
+
+ClawRouter speech can consume a qualified, model-less Gradium offer for
+`gradium.speech` → `audio.binary` at `POST /api/post/speech/tts`. This requires an
+active Worker implementation and an eligible offer in the selected proxy key's
+current catalog. Client support alone does not activate the route.
+
+Select Gradium in the ClawRouter speech settings, rather than inventing a model
+ID or configuring a direct Gradium key:
+
+```json5
+{
+  tts: {
+    provider: "clawrouter",
+    providers: {
+      clawrouter: {
+        upstreamProvider: "gradium",
+        voiceId: "your-gradium-voice",
+      },
+    },
+  },
+  talk: {
+    provider: "clawrouter",
+    providers: {
+      clawrouter: {
+        upstreamProvider: "gradium",
+        speakerVoiceId: "your-gradium-voice",
+      },
+    },
+  },
+}
+```
+
+Keep `models.providers.clawrouter` configured with the router base URL and proxy
+credential. An explicit speech `profileId` remains bound to a ClawRouter profile.
+Missing or rejected proxy credentials never fall back to `GRADIUM_API_KEY`.
+Do not set a speech `model`/`modelId` or an agent `voiceModel` for this model-less
+route. Speed and instruction overrides are unsupported and rejected.
+
+Audio files use WAV and voice notes use Opus. Proxy telephony is not qualified
+and fails before submission; direct Gradium telephony behavior is unchanged.
+Talk voice overrides select native `voice_id`; unary requests retain
+`only_audio: true` and `json_config: '{"padding_bonus":0}'`. Native and manifest
+offers are supported. Each synthesis refreshes the credential-scoped catalog;
+stale observations, foreign routes, unknown formats, and revoked offers fail
+closed. Only HTTP 200 with WAV/`audio/wav` or Opus/`audio/ogg` is accepted.
+Synthesis redirects are rejected, and complete binary reads retain the caller's
+deadline and the smaller of its configured audio cap and 16 MiB. No streaming, WebSocket, or live billing
+qualification is implied.
 
 ## Quotas and usage
 
@@ -458,12 +649,35 @@ shows the pool of the policy your agents route through. The key stays on the
 Gateway and is never included in the page response.
 
 Pool visibility is opt-in on the ClawRouter policy. If it is hidden, ask your
-ClawRouter admin to enable pool status for that policy. An older deployment
-without `/v1/pool` reports that an update is needed; rejected keys and temporary
-connection failures have separate next-step messages. These states do not
-prevent model calls or the existing `/v1/usage` snapshot.
+ClawRouter admin to enable pool status for that policy. A deployment without
+`/v1/pool` reports that it does not provide pool status. The pool page distinguishes a
+rejected key from other load failures. These states do not prevent model calls
+or the existing `/v1/usage` snapshot.
 
 ## Troubleshooting
+
+An upstream Anthropic `400` reporting `credit balance is too low` is a
+ClawRouter upstream-service failure, not a rejected ClawRouter key. OpenClaw
+keeps that key available to other requests and immediately tries the next configured
+fallback model without retrying the depleted route. Ask the ClawRouter operator to repair the upstream account, or retry
+with another available model. An explicit chat model pin still prevents silent
+model switching; a cron job's own model and fallback list remain independent of
+that pin. Router-key authentication failures and router budget denials retain
+their normal credential cooldown behavior.
+
+ClawRouter owns account rotation and per-model capacity, so a ClawRouter failure
+classified as a rate limit or overload never puts the ClawRouter key into a local
+cooldown, even with a day-long `Retry-After`. Other ClawRouter models stay
+selectable, and the limited model stays eligible: a later request for it asks
+ClawRouter again. A `429` that reports a billing or budget denial still cools
+down the key. A rate-limit cooldown that an earlier release stored for the key
+stops blocking requests after the update.
+
+`invalid_request_error` alone does not identify the cause: Anthropic also uses it
+for exhausted upstream credits. Check the bounded, credential-redacted
+`providerError` in the HTTP `400` `[model-fetch]` log. Request-format failures
+surface the provider's message instead of switching models; the credit-balance
+exception above applies only to that specific upstream message.
 
 | Symptom                                  | Check                                                                                                                                              |
 | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -479,7 +693,7 @@ prevent model calls or the existing `/v1/usage` snapshot.
 - Catalog discovery is scoped to the configured ClawRouter key. Conversational inventory responses are cached by endpoint and resolved credential; changing either does not reuse the previous response. Prepared inventory and dynamic model lookup retain their own agent, workspace, and auth scopes. Decisions check the selected key’s catalog on every call.
 - The ClawRouter key is attached only at request dispatch; it is not stored in model metadata.
 - Automatic attribution and request-correlation values are trimmed and control-character rejected before dispatch. Attribution values are bounded to 256 characters; request ids are bounded to 128.
-- Model transport diagnostics contain metadata only and never include the ClawRouter key or model content.
+- Model transport diagnostics contain metadata and bounded, credential-redacted HTTP `400` error details, never the ClawRouter key or model request content.
 - Native Anthropic and Gemini model ids are rewritten to their upstream ids only at dispatch.
 - Unsupported or ungranted catalog rows are not advertised for chat. Static decision support never grants a key permission to execute.
 
